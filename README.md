@@ -73,8 +73,9 @@ The run takes about 15 seconds and has no network calls or API keys. It:
    prints averages plus a **paired** regret difference vs the baseline (± s.e.);
 4. sweeps the re-run budget of `rerun_top_k` (shortlist of 2, 3, 5 or all
    versions × 1, 2, 4 or 8 extra runs each) and prints regret and cost for each;
-5. writes `figures/trajectory.png` (feedback vs held-out for one lineage where the
-   baseline misses the held-out best), `figures/regret.png` (mean regret per
+5. writes `figures/trajectory.png` (feedback vs held-out, with the max-feedback
+   pick and the re-run pick, for two lineages where the baseline misses),
+   `figures/regret.png` (mean regret per
    rule) and `figures/rerun_budget.png` (regret vs re-run budget).
 
 Options: `--seed N`, `--replicates N` (`1` = only the 9-lineage run),
@@ -143,6 +144,21 @@ true differences are a few tenths of a point. That is why the replicate average
 is printed as well.
 
 ![trajectory](figures/trajectory.png)
+
+The trajectory figure shows the first lineage (sim-03) where re-running improves
+on the max-feedback pick, and the first (sim-01) where it doesn't. The
+examples are taken in lineage order rather than hand-chosen, and the header gives
+the tally across all 9 lineages. The green diamonds are 5-run averages, drawn only for the
+3 shortlisted versions (the only ones the rule re-runs).
+
+* **sim-03:** H3's feedback of 60 was a lucky run. Its 5-run average falls to
+  ~51, so the rule switches to H4 and misses by 0.6 points instead of 2.0.
+* **sim-01:** re-running exposes H3's spike (69 → ~62), but the true best, H4,
+  ranked only 5th on its single feedback run. It never made the top-3
+  shortlist, so re-running couldn't find it. A bigger shortlist fixes this
+  lineage. With the top 5 and 4 re-runs each, the rule picks H5 and misses by
+  1.2. With the top 5 and 8 re-runs each, it picks H4 exactly.
+
 ![regret](figures/regret.png)
 
 ### Re-running the shortlist: regret vs budget
