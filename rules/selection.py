@@ -242,7 +242,7 @@ def rerun_top_k(
     not have that many re-runs.
     """
     scores = np.asarray(feedback_scores, dtype=float)
-    shortlist = np.sort(np.argsort(-scores, kind="stable")[:k])  # top k, back in version order
+    shortlist = rerun_shortlist(scores, k)
     averages = []
     for i in shortlist:
         runs = None if rerun_scores is None else rerun_scores[i]
@@ -250,3 +250,9 @@ def rerun_top_k(
             raise RuleUnavailable(f"rerun_top_k needs {n_reruns} re-runs of version H{i}")
         averages.append(np.mean([scores[i], *runs[:n_reruns]]))
     return int(shortlist[_first_argmax(np.array(averages))])
+
+
+def rerun_shortlist(feedback_scores: np.ndarray, k: int) -> np.ndarray:
+    """Indices of the k highest feedback scores (earliest on ties), in version order."""
+    scores = np.asarray(feedback_scores, dtype=float)
+    return np.sort(np.argsort(-scores, kind="stable")[:k])

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import sys
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from data.loader import DEFAULT_REAL_DATA_PATH, RealDataNotFound, load_lineages
 from data.simulator import DEFAULT_SEED, SimConfig, simulate_lineages
 from evaluate import evaluate_all, rerun_budget_sweep, summarize
 from metrics import describe_dataset, heldout_scores
-from rules.selection import BASELINE, DEFAULT_NOISE_SD
+from rules.selection import BASELINE, DEFAULT_NOISE_SD, rerun_shortlist, rerun_top_k
 
 FIGURES_DIR = Path(__file__).resolve().parent / "figures"
 FLOOR_RULES = {BASELINE, "pick_last", "pick_h0"}  # the baselines/floors in architecture.md §5
@@ -129,48 +130,98 @@ def _fmt(render):
 # --------------------------------------------------------------------------- #
 
 
-def pick_sample_lineage(lineages: list[Lineage], results: pd.DataFrame) -> Lineage:
-    """First lineage where the baseline misses the held-out best (else the first one)."""
-    baseline = results[results["rule"] == BASELINE].set_index("lineage_id")
-    for lineage in lineages:
-        row = baseline.loc[lineage.lineage_id]
-        if row["chosen_index"] != row["oracle_index"]:
-            return lineage
-    return lineages[0]
+RERUN_COLOR = "#1baf7a"  # categorical slot 3: the re-run average (slots 1-2 are feedback / held-out)
+RERUN_RULE = "rerun_top_k"
 
 
-def plot_trajectory(lineage: Lineage, results: pd.DataFrame, path: Path) -> None:
-    """Figure (a): feedback vs held-out score across versions of one lineage."""
+def pick_example_lineages(lineages: list[Lineage], results: pd.DataFrame) -> list[Lineage]:
+    """Two lineages where the baseline misses: one re-running fixes, one it doesn't.
+
+    Taking the FIRST lineage of each kind (not the most dramatic) keeps the
+    examples from being cherry-picked. Falls back to a single example if the
+    data has only one kind, or no re-run results at all.
+    """
+    regret = results.pivot(index="lineage_id", columns="rule", values="regret")
+    misses = [lin for lin in lineages if regret.loc[lin.lineage_id, BASELINE] > 0]
+    if not misses:
+        return lineages[:1]
+    if RERUN_RULE not in regret or regret[RERUN_RULE].isna().any():
+        return misses[:1]
+    improved = [lin for lin in misses if regret.loc[lin.lineage_id, RERUN_RULE] < regret.loc[lin.lineage_id, BASELINE]]
+    not_improved = [lin for lin in misses if lin not in improved]
+    return (improved[:1] + not_improved[:1]) or misses[:1]
+
+
+def plot_trajectory(lineages: list[Lineage], results: pd.DataFrame, path: Path) -> None:
+    """Figure (a): feedback vs held-out per version, with the baseline and re-run picks."""
+    examples = pick_example_lineages(lineages, results)
+    fig, axes = plt.subplots(len(examples), 1, figsize=(8, 4.2 * len(examples)), squeeze=False)
+    for ax, lineage in zip(axes[:, 0], examples):
+        _plot_one_trajectory(ax, lineage, results)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=9)
+    fig.suptitle(_rerun_tally(results), x=0.01, ha="left", fontsize=11, color=INK)
+    fig.tight_layout(rect=(0, 0.04 if len(examples) > 1 else 0.1, 1, 0.96))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def _plot_one_trajectory(ax, lineage: Lineage, results: pd.DataFrame) -> None:
+    """One panel: the two score lines, the re-run averages of the shortlist, and the picks."""
     feedback = np.array([v.feedback_score for v in lineage.versions])
     heldout = heldout_scores(lineage)
     x = np.arange(len(lineage))
-    row = results[(results["rule"] == BASELINE) & (results["lineage_id"] == lineage.lineage_id)].iloc[0]
-    chosen, oracle = int(row["chosen_index"]), int(row["oracle_index"])
+    rows = results[results["lineage_id"] == lineage.lineage_id].set_index("rule")
+    baseline_pick, oracle = int(rows.loc[BASELINE, "chosen_index"]), int(rows.loc[BASELINE, "oracle_index"])
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(x, feedback, color=FEEDBACK_COLOR, lw=2, marker="o", ms=7, label="feedback score (visible)")
+    ax.plot(x, feedback, color=FEEDBACK_COLOR, lw=2, marker="o", ms=7, label="feedback score (one run)")
     ax.plot(x, heldout, color=HELDOUT_COLOR, lw=2, marker="s", ms=7, label="held-out score (ground truth)")
-    _annotate(ax, chosen, feedback[chosen], "max-feedback pick", FEEDBACK_COLOR, offset=(0, 14))
-    _annotate(ax, oracle, heldout[oracle], "held-out best", HELDOUT_COLOR, offset=(0, 14))
+    _ring(ax, baseline_pick, feedback[baseline_pick], FEEDBACK_COLOR, "max-feedback pick")
+    _ring(ax, oracle, heldout[oracle], HELDOUT_COLOR, "held-out best")
+    title = f"{lineage.lineage_id}: max-feedback pick misses by {heldout[oracle] - heldout[baseline_pick]:.1f}"
+
+    has_reruns = RERUN_RULE in rows.index and not pd.isna(rows.loc[RERUN_RULE, "chosen_index"])
+    if has_reruns:
+        defaults = inspect.signature(rerun_top_k).parameters
+        k, n = defaults["k"].default, defaults["n_reruns"].default
+        shortlist = rerun_shortlist(feedback, k)
+        averages = {i: np.mean([feedback[i], *lineage.versions[i].rerun_scores[:n]]) for i in shortlist}
+        for i, avg in averages.items():
+            ax.plot([i, i], [feedback[i], avg], color=RERUN_COLOR, lw=1.2, ls=":")
+        ax.scatter(list(averages), list(averages.values()), marker="D", s=55, color=RERUN_COLOR, zorder=4,
+                   label=f"average of {n + 1} runs (top {k} only)")
+        rerun_pick = int(rows.loc[RERUN_RULE, "chosen_index"])
+        _ring(ax, rerun_pick, averages[rerun_pick], RERUN_COLOR, "re-run pick")
+        title += f"; re-run pick misses by {heldout[oracle] - heldout[rerun_pick]:.1f}"
+        if oracle not in shortlist:
+            rank = int((feedback > feedback[oracle]).sum()) + 1
+            title += f"\n(the held-out best, H{oracle}, ranked #{rank} on feedback: never shortlisted)"
+
     ax.set_xticks(x, [f"H{i}" for i in x])
     ax.set_xlabel("version")
     ax.set_ylabel("score (0-100)")
-    regret = heldout[oracle] - heldout[chosen]
-    ax.set_title(
-        f"Lineage {lineage.lineage_id}: chasing the feedback peak costs {regret:.1f} held-out points",
-        loc="left", fontsize=11, color=INK,
-    )
-    ax.legend(frameon=False, loc="best")
+    ax.set_title(title, loc="left", fontsize=10, color=INK)
     _style_axes(ax)
-    ax.margins(y=0.2)
-    _save(fig, path)
+    ax.margins(y=0.25)
 
 
-def _annotate(ax, x: int, y: float, text: str, color: str, offset: tuple[int, int]) -> None:
-    """Ring a point and label it."""
-    ax.scatter([x], [y], s=220, facecolors="none", edgecolors=color, linewidths=2, zorder=3)
-    ax.annotate(text, (x, y), textcoords="offset points", xytext=offset, ha="center",
-                fontsize=9, color=MUTED_INK)
+def _rerun_tally(results: pd.DataFrame) -> str:
+    """One-line context: how re-running did on EVERY lineage, not just the examples."""
+    regret = results.pivot(index="lineage_id", columns="rule", values="regret")
+    if RERUN_RULE not in regret or regret[RERUN_RULE].isna().any():
+        return "The paper's rule chases the feedback peak"
+    diff = regret[RERUN_RULE] - regret[BASELINE]
+    better, worse = int((diff < 0).sum()), int((diff > 0).sum())
+    return (f"Re-run pick vs max-feedback pick across all {len(diff)} lineages:\n"
+            f"better on {better}, worse on {worse}, same on {len(diff) - better - worse}")
+
+
+def _ring(ax, x: int, y: float, color: str, text: str) -> None:
+    """Ring a point and label it just above."""
+    ax.scatter([x], [y], s=240, facecolors="none", edgecolors=color, linewidths=2, zorder=5)
+    ax.annotate(text, (x, y), textcoords="offset points", xytext=(0, 13), ha="center",
+                fontsize=8, color=MUTED_INK)
 
 
 def plot_regret_bars(table: pd.DataFrame, path: Path, subtitle: str) -> None:
@@ -289,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         print(format_table(headline))
 
     figures = ["trajectory.png", "regret.png"]
-    plot_trajectory(pick_sample_lineage(lineages, results), results, args.figures_dir / "trajectory.png")
+    plot_trajectory(lineages, results, args.figures_dir / "trajectory.png")
     plot_regret_bars(headline, args.figures_dir / "regret.png", subtitle)
 
     sweep = rerun_budget_sweep(datasets)
