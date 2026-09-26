@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+# Real lineage data is supplied locally; keep it out of git unless licensed for release.
+data/real/
