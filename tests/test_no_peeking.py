@@ -20,6 +20,7 @@ class GuardedVersion:
         self.feedback_score = version.feedback_score
         self.features = version.features
         self.task_feedback = version.task_feedback
+        self.rerun_scores = version.rerun_scores
 
     @property
     def heldout_score(self):

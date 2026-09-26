@@ -1,7 +1,7 @@
 """Holdfast entrypoint: load lineages, evaluate every rule, print a table, save figures.
 
     python run.py                          # 9 simulated lineages (seed 7) + average over 100 datasets
-    python run.py --replicates 1           # just the single 9-lineage dataset
+    python run.py --replicates 1           # just the single 9-lineage dataset (also used for the re-run sweep)
     python run.py --source real            # real lineages via data/loader.py
 """
 
@@ -21,9 +21,9 @@ import pandas as pd
 from data.contract import Lineage, validate_lineages
 from data.loader import DEFAULT_REAL_DATA_PATH, RealDataNotFound, load_lineages
 from data.simulator import DEFAULT_SEED, SimConfig, simulate_lineages
-from evaluate import evaluate_all, summarize
+from evaluate import evaluate_all, rerun_budget_sweep, summarize
 from metrics import describe_dataset, heldout_scores
-from rules.selection import BASELINE
+from rules.selection import BASELINE, DEFAULT_NOISE_SD
 
 FIGURES_DIR = Path(__file__).resolve().parent / "figures"
 FLOOR_RULES = {BASELINE, "pick_last", "pick_h0"}  # the baselines/floors in architecture.md §5
@@ -33,6 +33,7 @@ FLOOR_RULES = {BASELINE, "pick_last", "pick_h0"}  # the baselines/floors in arch
 FEEDBACK_COLOR, HELDOUT_COLOR = "#2a78d6", "#eb6834"
 CONTENDER_COLOR, FLOOR_COLOR = "#2a78d6", "#a3a29d"
 INK, MUTED_INK, GRID = "#0b0b0b", "#52514e", "#e4e3df"
+SERIES_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")  # categorical slots 1-4, fixed order
 
 
 def load_data(source: str, seed: int, data_path: Path, sim_config: SimConfig = SimConfig()) -> list[Lineage]:
@@ -42,11 +43,12 @@ def load_data(source: str, seed: int, data_path: Path, sim_config: SimConfig = S
     return lineages
 
 
-def replicate_summary(first_seed: int, n_replicates: int, sim_config: SimConfig = SimConfig()) -> pd.DataFrame:
+def replicate_summary(datasets: list[list[Lineage]]) -> pd.DataFrame:
     """Average the per-rule summary over many independently simulated datasets."""
+    n_replicates = len(datasets)
     tables = []
-    for r in range(n_replicates):
-        table = summarize(evaluate_all(simulate_lineages(first_seed + r, sim_config)))
+    for lineages in datasets:
+        table = summarize(evaluate_all(lineages))
         baseline_regret = table.loc[table["rule"] == BASELINE, "mean_regret"].iloc[0]
         table["delta_vs_baseline"] = table["mean_regret"] - baseline_regret  # paired within a dataset
         tables.append(table)
@@ -98,6 +100,22 @@ def format_table(table: pd.DataFrame, n_lineages: int | None = None) -> str:
         shown["picked held-out best"] = table["picked_heldout_best"].map(_fmt(lambda x: f"{x:.2f}"))
     if "tuned_knob" in table:
         shown["LOLO-tuned knob"] = table["tuned_knob"]
+    return shown.to_string(index=False)
+
+
+def format_sweep(sweep: pd.DataFrame) -> str:
+    """Render the re-run budget sweep as aligned text."""
+    shown = pd.DataFrame({
+        "shortlist k": sweep["k"].map(lambda k: f"{k}" if k < 10 else "all"),
+        "re-runs each": sweep["n_reruns"],
+        "noise sd": sweep["n_reruns"].map(lambda n: f"{DEFAULT_NOISE_SD / np.sqrt(1 + n):.1f}"),
+        "extra runs/lineage": sweep["extra_runs_per_lineage"].map(lambda x: f"{x:.1f}"),
+        "mean regret": sweep["mean_regret"].map(lambda x: f"{x:.2f}"),
+        "vs baseline (paired)": [
+            f"{d:+.2f}" + ("" if pd.isna(se) else f" ± {se:.2f}")
+            for d, se in zip(sweep["delta_vs_baseline"], sweep["se_of_delta"])
+        ],
+    })
     return shown.to_string(index=False)
 
 
@@ -182,6 +200,30 @@ def plot_regret_bars(table: pd.DataFrame, path: Path, subtitle: str) -> None:
     _save(fig, path)
 
 
+def plot_rerun_budget(sweep: pd.DataFrame, table: pd.DataFrame, path: Path, subtitle: str) -> None:
+    """Figure (c): regret of rerun_top_k as the re-run budget grows, vs reference rules."""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for color, (k, group) in zip(SERIES_COLORS, sweep.groupby("k", sort=True)):
+        label = "re-run all versions" if k >= 10 else f"re-run top {k}"
+        ax.plot(group["n_reruns"], group["mean_regret"], color=color, lw=2, marker="o", ms=7, label=label)
+    for rule, style in ((BASELINE, "--"), ("shrinkage", ":")):
+        value = table.loc[table["rule"] == rule, "mean_regret"].iloc[0]
+        ax.axhline(value, color=MUTED_INK, lw=1.2, ls=style)
+        ax.annotate(f"{rule} ({value:.2f})", (1, value), xytext=(2, 4), textcoords="offset points",
+                    fontsize=9, color=MUTED_INK)
+    ns = sorted(sweep["n_reruns"].unique())
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(ns, [str(n) for n in ns])
+    ax.set_xlabel("extra runs of each shortlisted version")
+    ax.set_ylabel("mean held-out regret (lower is better)")
+    baseline_regret = table.loc[table["rule"] == BASELINE, "mean_regret"].iloc[0]
+    ax.set_ylim(0, baseline_regret * 1.15)  # headroom so the baseline label clears the title
+    ax.set_title(f"Re-running the shortlist before choosing\n{subtitle}", loc="left", fontsize=11, color=INK)
+    ax.legend(frameon=False, loc="lower left")
+    _style_axes(ax)
+    _save(fig, path)
+
+
 def _style_axes(ax, grid_axis: str = "y") -> None:
     """Recessive grid and axes so the data carries the ink."""
     ax.grid(axis=grid_axis, color=GRID, lw=0.8)
@@ -238,16 +280,28 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nResults on this dataset ({len(lineages)} lineages; knobs tuned leave-one-lineage-out):\n")
     print(format_table(table, n_lineages=len(lineages)))
 
-    headline, subtitle = table, f"{source}, {len(lineages)} lineages"
+    headline, subtitle, datasets = table, f"{source}, {len(lineages)} lineages", [lineages]
     if args.source == "sim" and args.replicates > 1:
-        headline = replicate_summary(args.seed, args.replicates, sim_config)
+        datasets = [simulate_lineages(args.seed + r, sim_config) for r in range(args.replicates)]
+        headline = replicate_summary(datasets)
         subtitle = f"averaged over {args.replicates} simulated datasets of 9 lineages (± 1 s.e.)"
         print(f"\nAveraged over {args.replicates} simulated datasets (seeds {args.seed}..{args.seed + args.replicates - 1}):\n")
         print(format_table(headline))
 
+    figures = ["trajectory.png", "regret.png"]
     plot_trajectory(pick_sample_lineage(lineages, results), results, args.figures_dir / "trajectory.png")
     plot_regret_bars(headline, args.figures_dir / "regret.png", subtitle)
-    print(f"\nSaved figures to {args.figures_dir}/trajectory.png and {args.figures_dir}/regret.png")
+
+    sweep = rerun_budget_sweep(datasets)
+    if sweep.empty:
+        print("\nRe-run budget sweep: n/a (this data has no re-runs of each version).")
+    else:
+        where = f"{len(datasets)} datasets of {len(lineages)} lineages" if len(datasets) > 1 else source
+        print(f"\nRe-run budget for rerun_top_k ({where}; each version's original run is averaged in):\n")
+        print(format_sweep(sweep))
+        plot_rerun_budget(sweep, headline, args.figures_dir / "rerun_budget.png", f"mean over {where}")
+        figures.append("rerun_budget.png")
+    print(f"\nSaved figures to {args.figures_dir}/: " + ", ".join(figures))
     if args.source == "sim":
         print("Note: simulated results are illustrative only until real lineages are loaded.")
     return 0

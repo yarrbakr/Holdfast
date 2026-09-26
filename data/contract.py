@@ -12,13 +12,17 @@ A *version* carries:
 * ``heldout_score``   -- ground truth; used ONLY by ``metrics.py`` for grading.
 * ``features``        -- observable edit metadata; selection rules may use it.
 
-Two optional fields support the ``validation_split`` rule (architecture.md §5,
-§10). They are ``None`` whenever a data source has no per-task results:
+Optional fields enable rules that need more than one score per version. Each
+is ``None`` whenever a data source does not have that data:
 
 * ``Version.task_feedback``   -- per-task feedback outcomes (0..1 each) whose
   mean x 100 is the version's ``feedback_score``.
 * ``Lineage.selection_tasks`` -- indices into ``task_feedback`` of the tasks
   that were withheld from the evolving model and kept purely for selection.
+  Together with ``task_feedback`` this enables ``validation_split``.
+* ``Version.rerun_scores``    -- extra, independent re-runs of the frozen
+  version on the same feedback set (each one scored like ``feedback_score``).
+  Enables ``rerun_top_k``.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ class Version:
     heldout_score: float
     features: dict[str, Any]
     task_feedback: tuple[float, ...] | None = None
+    rerun_scores: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +96,10 @@ def validate_lineage(lineage: Lineage) -> None:
             validate_features(version.features)
         except ValueError as err:
             raise ValueError(f"{where}: {err}") from None
+        if version.rerun_scores is not None and not all(
+            isinstance(x, float) and math.isfinite(x) for x in version.rerun_scores
+        ):
+            raise ValueError(f"{where}: rerun_scores must be finite floats")
 
     _validate_task_data(lineage)
 

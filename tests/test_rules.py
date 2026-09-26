@@ -13,6 +13,7 @@ from rules.selection import (
     one_standard_error,
     pick_h0,
     pick_last,
+    rerun_top_k,
     shrinkage,
     thresholdout,
     validation_split,
@@ -78,11 +79,47 @@ class ShrinkageTest(unittest.TestCase):
         self.assertIn(shrinkage(scores, NO_FEATURES, correlation=0.9), (4, 5, 6))
 
 
+class ExplodingReruns(tuple):
+    """Re-runs of a version the rule did NOT shortlist: reading them is a budget violation."""
+
+    def __getitem__(self, item):
+        raise AssertionError("rerun_top_k read re-runs of a version outside its shortlist")
+
+    def __len__(self):
+        raise AssertionError("rerun_top_k read re-runs of a version outside its shortlist")
+
+
+class RerunTopKTest(unittest.TestCase):
+    def test_re_runs_overturn_a_lucky_spike(self):
+        scores = np.array([50.0, 62.0, 57.0])  # H1 looks best, but its re-runs are mediocre
+        reruns = ((50.0,) * 4, (51.0, 52.0, 50.0, 53.0), (58.0, 57.0, 59.0, 58.0))
+        self.assertEqual(baseline_max_feedback(scores, NO_FEATURES), 1)
+        self.assertEqual(rerun_top_k(scores, NO_FEATURES, rerun_scores=reruns, k=2, n_reruns=4), 2)
+
+    def test_only_reads_the_shortlist_and_the_budget(self):
+        scores = np.array([50.0, 62.0, 57.0, 40.0])
+        reruns = (ExplodingReruns(), (60.0, 61.0, 99.0), (57.0, 58.0, 0.0), ExplodingReruns())
+        # k=2 shortlists H1 and H2; n_reruns=2 must ignore each version's third re-run.
+        self.assertEqual(rerun_top_k(scores, NO_FEATURES, rerun_scores=reruns, k=2, n_reruns=2), 1)
+
+    def test_shortlist_of_one_is_the_baseline(self):
+        scores = np.array([50.0, 62.0, 57.0])
+        reruns = ((70.0,), (40.0,), (70.0,))
+        self.assertEqual(rerun_top_k(scores, NO_FEATURES, rerun_scores=reruns, k=1, n_reruns=1), 1)
+
+    def test_unavailable_without_enough_re_runs(self):
+        scores = np.array([50.0, 62.0])
+        with self.assertRaises(RuleUnavailable):
+            rerun_top_k(scores, NO_FEATURES)
+        with self.assertRaises(RuleUnavailable):
+            rerun_top_k(scores, NO_FEATURES, rerun_scores=((1.0,), (1.0,)), k=2, n_reruns=4)
+
+
 class RegistryTest(unittest.TestCase):
     def test_all_architecture_rules_are_registered(self):
         expected = {
             "baseline_max_feedback", "pick_last", "pick_h0", "one_standard_error",
-            "thresholdout", "validation_split", "shrinkage",
+            "thresholdout", "validation_split", "shrinkage", "rerun_top_k",
         }
         self.assertEqual(set(RULES), expected)
 

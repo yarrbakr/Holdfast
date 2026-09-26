@@ -28,12 +28,21 @@ def visible_inputs(lineage: Lineage, spec: RuleSpec) -> dict:
             np.array([v.task_feedback for v in lineage.versions], dtype=float) if has_tasks else None
         )
         inputs["selection_tasks"] = np.array(lineage.selection_tasks, dtype=int) if has_tasks else None
+    if spec.needs_reruns:
+        reruns = tuple(v.rerun_scores for v in lineage.versions)
+        inputs["rerun_scores"] = None if all(r is None for r in reruns) else reruns
     return inputs
 
 
-def choose(spec: RuleSpec, lineage: Lineage, knob_value: float | None = None) -> int:
-    """Apply one rule to one lineage; ``knob_value=None`` uses the rule's default."""
-    options = {} if knob_value is None else {spec.knob: knob_value}
+def choose(spec: RuleSpec, lineage: Lineage, knob_value: float | None = None, **fixed_options) -> int:
+    """Apply one rule to one lineage.
+
+    ``knob_value=None`` uses the rule's default knob. ``fixed_options`` pins other
+    keyword arguments (e.g. the re-run budget in ``rerun_budget_sweep``).
+    """
+    options = dict(fixed_options)
+    if knob_value is not None:
+        options[spec.knob] = knob_value
     chosen = spec.func(**visible_inputs(lineage, spec), **options)
     if not 0 <= chosen < len(lineage):
         raise ValueError(f"rule {spec.name} returned invalid index {chosen}")
@@ -129,3 +138,39 @@ def _describe_knob(group: pd.DataFrame) -> str:
     if values.empty:
         return f"{knob}=default"
     return f"{knob}: " + "/".join(f"{v:g}" for v in sorted(values.unique()))
+
+
+def rerun_budget_sweep(
+    datasets: list[list[Lineage]],
+    ks: tuple[int, ...] = (2, 3, 5, 10),
+    reruns: tuple[int, ...] = (1, 2, 4, 8),
+) -> pd.DataFrame:
+    """Regret of ``rerun_top_k`` at each re-run budget, paired against the baseline.
+
+    For every (k, n_reruns) pair, returns the mean regret over all datasets, the
+    mean paired difference from ``baseline_max_feedback`` with its standard error,
+    and the average number of extra feedback runs per lineage. Returns an empty
+    frame when the data has no re-runs.
+    """
+    spec, baseline = RULES["rerun_top_k"], RULES[BASELINE]
+    baseline_regret = np.array([mean_regret(baseline, lineages, None) for lineages in datasets])
+    rows = []
+    for k in ks:
+        for n in reruns:
+            try:
+                regret = np.array([
+                    np.mean([held_out_regret(lin, choose(spec, lin, k=k, n_reruns=n)) for lin in lineages])
+                    for lineages in datasets
+                ])
+            except RuleUnavailable:
+                return pd.DataFrame()
+            delta = regret - baseline_regret
+            rows.append({
+                "k": k,
+                "n_reruns": n,
+                "extra_runs_per_lineage": float(np.mean([min(k, len(lin)) * n for d in datasets for lin in d])),
+                "mean_regret": float(regret.mean()),
+                "delta_vs_baseline": float(delta.mean()),
+                "se_of_delta": float(delta.std(ddof=1) / np.sqrt(len(datasets))) if len(datasets) > 1 else float("nan"),
+            })
+    return pd.DataFrame(rows)

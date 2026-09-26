@@ -43,6 +43,7 @@ class RuleSpec:
     knob: str | None = None  # name of the tunable keyword argument, if any
     grid: tuple[float, ...] = field(default_factory=tuple)  # candidate knob values
     needs_task_data: bool = False  # also receives task_feedback / selection_tasks
+    needs_reruns: bool = False  # also receives rerun_scores
 
 
 RULES: dict[str, RuleSpec] = {}
@@ -52,13 +53,16 @@ def register_rule(
     knob: str | None = None,
     grid: tuple[float, ...] = (),
     needs_task_data: bool = False,
+    needs_reruns: bool = False,
 ) -> Callable[[Callable[..., int]], Callable[..., int]]:
     """Decorator that adds a rule to ``RULES`` (registration order = table order)."""
 
     def decorator(func: Callable[..., int]) -> Callable[..., int]:
         if (knob is None) != (len(grid) == 0):
             raise ValueError(f"{func.__name__}: a knob needs a grid and vice versa")
-        RULES[func.__name__] = RuleSpec(func.__name__, func, knob, tuple(grid), needs_task_data)
+        RULES[func.__name__] = RuleSpec(
+            func.__name__, func, knob, tuple(grid), needs_task_data, needs_reruns
+        )
         return func
 
     return decorator
@@ -207,3 +211,42 @@ def shrunk_scores(
     prior_cov = signal_var * prior_corr
     gain = prior_cov @ np.linalg.inv(prior_cov + noise_sd**2 * np.eye(n))
     return mean + gain @ (scores - mean)
+
+
+@register_rule(needs_reruns=True)
+def rerun_top_k(
+    feedback_scores: np.ndarray,
+    features: tuple[dict, ...],
+    *,
+    rerun_scores: tuple[tuple[float, ...] | None, ...] | None = None,
+    k: int = 3,
+    n_reruns: int = 4,
+) -> int:
+    """Re-run the k best-looking versions n_reruns more times, then pick the best average.
+
+    This rule gets less noisy evidence instead of reasoning around the noise.
+    Averaging m independent runs divides the noise sd by sqrt(m), so the four
+    runs of the default (1 original + ``n_reruns=4``) cut it from ~4.75 to ~2.1
+    points. Only the ``k`` shortlisted versions are re-run, so each lineage
+    costs ``k * n_reruns`` extra feedback runs.
+
+    Each candidate's original score is averaged together with its re-runs. That
+    score is biased upward (it is why the version made the shortlist), but it
+    is still a real measurement. On simulated data, keeping it did better than
+    dropping it at every budget tried. Re-running cannot remove the adaptive
+    overfitting that is baked into a version, so regret levels off above zero
+    however large the budget.
+
+    Only ``rerun_scores[i]`` for shortlisted versions is read, and at most
+    ``n_reruns`` entries of each. Raises RuleUnavailable when a candidate does
+    not have that many re-runs.
+    """
+    scores = np.asarray(feedback_scores, dtype=float)
+    shortlist = np.sort(np.argsort(-scores, kind="stable")[:k])  # top k, back in version order
+    averages = []
+    for i in shortlist:
+        runs = None if rerun_scores is None else rerun_scores[i]
+        if runs is None or len(runs) < n_reruns:
+            raise RuleUnavailable(f"rerun_top_k needs {n_reruns} re-runs of version H{i}")
+        averages.append(np.mean([scores[i], *runs[:n_reruns]]))
+    return int(shortlist[_first_argmax(np.array(averages))])
