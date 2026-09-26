@@ -13,8 +13,8 @@ from evaluate import evaluate_all
 
 
 def write_csvs(lineages, directory: Path) -> Path:
-    """Write lineages in the documented CSV schema (versions + per-task file)."""
-    version_rows, task_rows = [], []
+    """Write lineages in the documented CSV schema (versions + per-task + re-run files)."""
+    version_rows, task_rows, rerun_rows = [], [], []
     for lin in lineages:
         selection = set(lin.selection_tasks)
         for i, v in enumerate(lin.versions):
@@ -23,6 +23,11 @@ def write_csvs(lineages, directory: Path) -> Path:
                  "feedback_score": v.feedback_score, "heldout_score": v.heldout_score,
                  **{k: v.features[k] for k in FEATURE_KEYS}}
             )
+            for run_index, score in enumerate(v.rerun_scores):
+                rerun_rows.append(
+                    {"lineage_id": lin.lineage_id, "version_index": i, "run_index": run_index,
+                     "feedback_score": score}
+                )
             for task_id, score in enumerate(v.task_feedback):
                 task_rows.append(
                     {"lineage_id": lin.lineage_id, "version_index": i, "task_id": task_id,
@@ -31,6 +36,7 @@ def write_csvs(lineages, directory: Path) -> Path:
     path = directory / "lineages.csv"
     pd.DataFrame(version_rows).to_csv(path, index=False)
     pd.DataFrame(task_rows).to_csv(directory / "lineages_tasks.csv", index=False)
+    pd.DataFrame(rerun_rows).to_csv(directory / "lineages_reruns.csv", index=False)
     return path
 
 
@@ -65,6 +71,13 @@ class LoaderTest(unittest.TestCase):
         by_rule = results.groupby("rule")["regret"]
         self.assertTrue(by_rule.apply(lambda s: s.isna().all())["validation_split"])
         self.assertFalse(results[results["rule"] != "validation_split"]["regret"].isna().any())
+
+    def test_csv_without_rerun_file_disables_rerun_top_k_only(self):
+        path = write_csvs(self.lineages, self.dir)
+        (self.dir / "lineages_reruns.csv").unlink()
+        results = evaluate_all(load_lineages(path))
+        missing = results.groupby("rule")["regret"].apply(lambda s: s.isna().all())
+        self.assertEqual(missing[missing].index.tolist(), ["rerun_top_k"])
 
     def test_bad_version_index_rejected(self):
         path = write_csvs(self.lineages, self.dir)

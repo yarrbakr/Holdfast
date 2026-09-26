@@ -43,6 +43,25 @@ class ContractTest(unittest.TestCase):
             for version in lineage.versions:
                 self.assertAlmostEqual(version.feedback_score, 100 * np.mean(version.task_feedback))
 
+    def test_re_runs_recorded_for_every_version(self):
+        for lineage in self.lineages:
+            for version in lineage.versions:
+                self.assertEqual(len(version.rerun_scores), SimConfig().n_reruns)
+
+    def test_re_runs_do_not_change_any_other_simulated_number(self):
+        without = simulate_lineages(seed=11, config=SimConfig(n_reruns=0))
+        for a, b in zip(self.lineages, without):
+            for va, vb in zip(a.versions, b.versions):
+                self.assertEqual(dataclasses.replace(va, rerun_scores=()), vb)
+
+    def test_re_runs_are_noisy_copies_of_the_same_version(self):
+        # Re-runs scatter around the version's expected feedback with sd ~4.75.
+        spread = [
+            np.std(v.rerun_scores, ddof=1)
+            for d in (simulate_lineages(seed=s) for s in range(10)) for lin in d for v in lin.versions
+        ]
+        self.assertTrue(4.2 <= np.mean(spread) <= 5.0, np.mean(spread))
+
     def test_validator_rejects_broken_lineages(self):
         good = self.lineages[0]
         bad_features = dataclasses.replace(

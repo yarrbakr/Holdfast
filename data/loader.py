@@ -28,6 +28,13 @@ score, is_selection_task``. ``score`` is that task's feedback result (0..1);
 model and kept only for final selection. Without any withheld tasks,
 ``validation_split`` reports n/a.
 
+Optional re-run file -- ``lineages_reruns.csv`` next to it (enables ``rerun_top_k``)
+------------------------------------------------------------------------------------
+One row per extra run of a frozen version on the same feedback set:
+``lineage_id, version_index, run_index, feedback_score``. Versions may have
+different numbers of re-runs, or none at all. ``rerun_top_k`` reports n/a when a
+shortlisted version has too few.
+
 JSON schema -- ``lineages.json``
 --------------------------------
 Exactly what ``save_lineages_json`` writes::
@@ -38,7 +45,8 @@ Exactly what ``save_lineages_json`` writes::
                                  "features": {"edit_files": 0, "edit_lines": 0,
                                               "touched_verification": false,
                                               "revision_calls": 0},
-                                 "task_feedback": [1, 0, ...] | null}, ...]}]}
+                                 "task_feedback": [1, 0, ...] | null,
+                                 "rerun_scores": [50.9, 53.6, ...] | null}, ...]}]}
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ DEFAULT_REAL_DATA_PATH = Path(__file__).resolve().parent / "real" / "lineages.cs
 
 VERSION_COLUMNS = ["lineage_id", "version_index", "feedback_score", "heldout_score", *FEATURE_KEYS]
 TASK_COLUMNS = ["lineage_id", "version_index", "task_id", "score", "is_selection_task"]
+RERUN_COLUMNS = ["lineage_id", "version_index", "run_index", "feedback_score"]
 
 NO_DATA_MESSAGE = """\
 No real lineage data found at: {path}
@@ -64,8 +73,8 @@ simulated data by default (python run.py --source sim).
 To use real data, write one row per version to data/real/lineages.csv with
 columns:
   {columns}
-(optionally add data/real/lineages_tasks.csv for per-task feedback), or supply a
-.json file; see the docstring of data/loader.py for the full schema. Then run:
+(optionally add data/real/lineages_tasks.csv for per-task feedback and
+data/real/lineages_reruns.csv for repeated runs), or supply a .json file; see the docstring of data/loader.py for the full schema. Then run:
   python run.py --source real [--data-path <file>]"""
 
 
@@ -94,24 +103,23 @@ def load_lineages(path: str | Path = DEFAULT_REAL_DATA_PATH) -> list[Lineage]:
 
 
 def _load_csv(path: Path) -> list[Lineage]:
-    """Parse the per-version CSV (plus the optional per-task CSV beside it)."""
+    """Parse the per-version CSV (plus the optional per-task and re-run CSVs beside it)."""
     versions = pd.read_csv(path, float_precision="round_trip")
     _require_columns(versions, VERSION_COLUMNS, path)
-    tasks_path = path.with_name(f"{path.stem}_tasks.csv")
-    tasks = pd.read_csv(tasks_path, float_precision="round_trip") if tasks_path.exists() else None
-    if tasks is not None:
-        _require_columns(tasks, TASK_COLUMNS, tasks_path)
+    tasks = _read_optional_csv(path.with_name(f"{path.stem}_tasks.csv"), TASK_COLUMNS)
+    reruns = _read_optional_csv(path.with_name(f"{path.stem}_reruns.csv"), RERUN_COLUMNS)
 
     lineages = []
     for lineage_id, rows in versions.groupby("lineage_id", sort=False):
         rows = rows.sort_values("version_index")
         _require_contiguous(rows["version_index"].tolist(), lineage_id)
         task_matrix, selection = _task_data_for(tasks, lineage_id, len(rows))
+        rerun_lists = _reruns_for(reruns, lineage_id, len(rows))
         lineages.append(
             Lineage(
                 lineage_id=str(lineage_id),
                 versions=tuple(
-                    _version_from_row(row, None if task_matrix is None else task_matrix[i])
+                    _version_from_row(row, None if task_matrix is None else task_matrix[i], rerun_lists[i])
                     for i, (_, row) in enumerate(rows.iterrows())
                 ),
                 selection_tasks=selection,
@@ -120,7 +128,18 @@ def _load_csv(path: Path) -> list[Lineage]:
     return lineages
 
 
-def _version_from_row(row: pd.Series, task_row: tuple[float, ...] | None) -> Version:
+def _read_optional_csv(path: Path, columns: list[str]) -> pd.DataFrame | None:
+    """Read a companion CSV if it exists, checking its columns."""
+    if not path.exists():
+        return None
+    frame = pd.read_csv(path, float_precision="round_trip")
+    _require_columns(frame, columns, path)
+    return frame
+
+
+def _version_from_row(
+    row: pd.Series, task_row: tuple[float, ...] | None, rerun_scores: tuple[float, ...] | None
+) -> Version:
     """Build one Version from a CSV row."""
     return Version(
         feedback_score=float(row["feedback_score"]),
@@ -132,7 +151,22 @@ def _version_from_row(row: pd.Series, task_row: tuple[float, ...] | None) -> Ver
             "revision_calls": int(row["revision_calls"]),
         },
         task_feedback=task_row,
+        rerun_scores=rerun_scores,
     )
+
+
+def _reruns_for(reruns: pd.DataFrame | None, lineage_id: str, n_versions: int) -> list[tuple[float, ...] | None]:
+    """Re-run scores of each version in run_index order (None for versions with no re-runs)."""
+    result: list[tuple[float, ...] | None] = [None] * n_versions
+    if reruns is None:
+        return result
+    rows = reruns[reruns["lineage_id"] == lineage_id]
+    for version_index, group in rows.groupby("version_index"):
+        if not 0 <= int(version_index) < n_versions:
+            raise ValueError(f"lineage {lineage_id!r}: re-run for unknown version {version_index}")
+        ordered = group.sort_values("run_index")["feedback_score"]
+        result[int(version_index)] = tuple(float(x) for x in ordered)
+    return result
 
 
 def _task_data_for(
@@ -174,6 +208,7 @@ def _lineage_from_dict(item: dict) -> Lineage:
             heldout_score=float(v["heldout_score"]),
             features=dict(v["features"]),
             task_feedback=None if v.get("task_feedback") is None else tuple(map(float, v["task_feedback"])),
+            rerun_scores=None if v.get("rerun_scores") is None else tuple(map(float, v["rerun_scores"])),
         )
         for v in item["versions"]
     )
@@ -198,6 +233,7 @@ def save_lineages_json(lineages: list[Lineage], path: str | Path) -> None:
                         "heldout_score": v.heldout_score,
                         "features": dict(v.features),
                         "task_feedback": None if v.task_feedback is None else list(v.task_feedback),
+                        "rerun_scores": None if v.rerun_scores is None else list(v.rerun_scores),
                     }
                     for v in lin.versions
                 ],

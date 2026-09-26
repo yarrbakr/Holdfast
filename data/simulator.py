@@ -18,6 +18,11 @@ Generative story for one lineage
    feedback tasks is withheld from the evolving model (``selection_tasks``):
    they carry the same noise but none of the overfitting bias.
 4. ``heldout_score`` is a cleaner readout of q_t (small noise only).
+5. ``rerun_scores`` are extra runs of each frozen version on the same feedback
+   set. They carry fresh noise but the SAME overfitting bias, because the bias
+   is baked into the harness and re-running cannot remove it. They come from a
+   separate random stream, so adding or removing them never changes any other
+   simulated number.
 
 Default parameters were calibrated (averaging 100 seeds) to the paper's
 statistics: feedback and held-out changes agree in direction ~53% of the time
@@ -55,15 +60,21 @@ class SimConfig:
     overfit_step_sd: float = 1.2  # scale of the per-edit feedback-only bias (half-normal)
     overfit_quality_cost: float = 0.5  # true quality lost per point of feedback-only bias
     heldout_noise_sd: float = 1.0  # held-out set is large, so it reads q_t cleanly
+    n_reruns: int = 8  # extra feedback runs recorded per version (for rerun_top_k)
 
 
 def simulate_lineages(seed: int = DEFAULT_SEED, config: SimConfig = SimConfig()) -> list[Lineage]:
     """Generate ``config.n_lineages`` lineages, fully determined by ``seed``."""
     rng = np.random.default_rng(seed)
-    return [_simulate_one_lineage(f"sim-{i:02d}", rng, config) for i in range(config.n_lineages)]
+    rerun_rng = np.random.default_rng([seed, 1])  # independent stream just for re-runs
+    return [
+        _simulate_one_lineage(f"sim-{i:02d}", rng, rerun_rng, config) for i in range(config.n_lineages)
+    ]
 
 
-def _simulate_one_lineage(lineage_id: str, rng: np.random.Generator, cfg: SimConfig) -> Lineage:
+def _simulate_one_lineage(
+    lineage_id: str, rng: np.random.Generator, rerun_rng: np.random.Generator, cfg: SimConfig
+) -> Lineage:
     """Simulate a single evolution run H0..Hn."""
     n_versions = int(rng.integers(cfg.min_versions, cfg.max_versions + 1))
     features = [_h0_features()] + [_draw_edit_features(rng) for _ in range(n_versions - 1)]
@@ -77,12 +88,17 @@ def _simulate_one_lineage(lineage_id: str, rng: np.random.Generator, cfg: SimCon
     for t in range(n_versions):
         tasks = _draw_task_outcomes(true_quality[t], overfit_bias[t], selection_tasks, rng, cfg)
         heldout = true_quality[t] + rng.normal(0.0, cfg.heldout_noise_sd)
+        reruns = [
+            _draw_task_outcomes(true_quality[t], overfit_bias[t], selection_tasks, rerun_rng, cfg)
+            for _ in range(cfg.n_reruns)
+        ]
         versions.append(
             Version(
                 feedback_score=float(100.0 * tasks.mean()),
                 heldout_score=float(np.clip(heldout, 0.0, 100.0)),
                 features=features[t],
                 task_feedback=tuple(float(x) for x in tasks),
+                rerun_scores=tuple(float(100.0 * run.mean()) for run in reruns),
             )
         )
     return Lineage(
